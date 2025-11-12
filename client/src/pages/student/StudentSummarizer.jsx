@@ -11,27 +11,55 @@ export default function StudentSummarizer() {
   const [videoIndex, setVideoIndex] = useState('');
   const [summary, setSummary] = useState('');
   const [loading, setLoading] = useState(false);
+  const [resourceText, setResourceText] = useState('');
 
-  const handleSummarize = async (docId) => {
-  try {
-    const { data } = await api.post(
-      `/students/${guestId}/documents/${docId}/summarize`
-    );
+  const handleSummarize = async (type) => {
+    setLoading(true);
+    setSummary('');
+    
+    try {
+      let textToSummarize = '';
+      
+      if (type === 'course') {
+        if (!courseId) {
+          toast.error('Please enter a course ID');
+          setLoading(false);
+          return;
+        }
+        // For demo, use courseId as text. In production, fetch course content
+        textToSummarize = `Course content for course ID: ${courseId}. This is a placeholder. In production, fetch actual course content.`;
+      } else if (type === 'video') {
+        if (!courseId || videoIndex === '') {
+          toast.error('Please enter both course ID and video index');
+          setLoading(false);
+          return;
+        }
+        // For demo, use video info as text. In production, fetch video transcript
+        textToSummarize = `Video transcript for course ${courseId}, video ${videoIndex}. This is a placeholder. In production, fetch actual video transcript.`;
+      } else if (type === 'text' && resourceText) {
+        textToSummarize = resourceText;
+      } else {
+        toast.error('Please provide content to summarize');
+        setLoading(false);
+        return;
+      }
 
-    const updatedDocs = documents.map((doc) =>
-      doc.id === docId ? { ...doc, summary: data.summary, isSummarized: true } : doc
-    );
+      const { data } = await api.post('/api/ai/summarize', {
+        resource_text: textToSummarize,
+        session_id: `summary_${Date.now()}`,
+        language_code: 'en-IN'
+      });
 
-    setDocuments(updatedDocs);
-
-    // ✅ Select the updated doc for modal
-    setSelectedDoc(updatedDocs.find((d) => d.id === docId));
-
-    toast.success("Summary created!");
-  } catch (error) {
-    toast.error("Failed to summarize");
-  }
-};
+      setSummary(data.summary || 'Summary generated successfully!');
+      toast.success('Summary created!');
+    } catch (error) {
+      console.error('Summarization error:', error);
+      toast.error('Failed to summarize. Please check if AI service is running.');
+      setSummary('Error: Could not generate summary. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
 
 
   return (
@@ -67,7 +95,7 @@ export default function StudentSummarizer() {
                   disabled={loading}
                 >
                   <BookOpen size={18} className="mr-2" />
-                  Summarize Course
+                  {loading ? 'Summarizing...' : 'Summarize Course'}
                 </Button>
               </CardContent>
             </Card>
@@ -107,7 +135,37 @@ export default function StudentSummarizer() {
                   disabled={loading}
                 >
                   <Video size={18} className="mr-2" />
-                  Summarize Video
+                  {loading ? 'Summarizing...' : 'Summarize Video'}
+                </Button>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center space-x-2">
+                  <FileText className="text-purple-500 dark:text-purple-400" size={24} />
+                  <span>Summarize Text</span>
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div>
+                  <label className="mb-2 block text-sm text-gray-600 dark:text-gray-400">Paste Text to Summarize</label>
+                  <textarea
+                    value={resourceText}
+                    onChange={(e) => setResourceText(e.target.value)}
+                    placeholder="Paste or type the content you want to summarize..."
+                    rows={6}
+                    className="w-full rounded-lg border border-gray-300 dark:border-gray-800 bg-white dark:bg-gray-900 px-4 py-2 text-black dark:text-white outline-none focus:border-black dark:focus:border-white resize-none"
+                  />
+                </div>
+                <Button
+                  variant="primary"
+                  className="w-full"
+                  onClick={() => handleSummarize('text')}
+                  disabled={loading || !resourceText.trim()}
+                >
+                  <FileText size={18} className="mr-2" />
+                  {loading ? 'Summarizing...' : 'Summarize Text'}
                 </Button>
               </CardContent>
             </Card>

@@ -11,10 +11,10 @@ import {
   FolderPlus,
   Search,
 } from "lucide-react";
-import axios from "axios";
 import Button from "../components/ui/Button";
+import api from "../lib/api";
 
-const AI_API = "http://127.0.0.1:5000";
+const AI_API = ""; // Use Node.js backend which proxies to Flask
 
 export default function Ai() {
   const [history, setHistory] = useState([]);
@@ -109,7 +109,7 @@ export default function Ai() {
     setInput("");
 
     try {
-      const res = await axios.post(`${AI_API}/chat`, {
+      const res = await api.post("/api/ai/chat", {
         message: input,
         session_id: chat.id,
       });
@@ -119,9 +119,10 @@ export default function Ai() {
         { from: "bot", text: res.data.response },
       ]);
     } catch (err) {
+      console.error("AI Chat Error:", err);
       setMessages((prev) => [
         ...prev,
-        { from: "bot", text: "⚠️ AI Server Error" },
+        { from: "bot", text: "⚠️ AI Server Error. Please check if AI service is running." },
       ]);
     }
   };
@@ -170,14 +171,20 @@ export default function Ai() {
     formData.append("audio", audioBlob, "voice.webm");
 
     try {
-      const stt = await axios.post(`${AI_API}/speech-to-text`, formData);
+      const stt = await api.post("/api/ai/speech-to-text", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
       const text = stt.data.transcription;
 
       if (text) {
         setInput(text);
       }
     } catch (err) {
-      console.log("Voice error");
+      console.error("Voice error:", err);
+      setMessages((prev) => [
+        ...prev,
+        { from: "bot", text: "⚠️ Voice recognition failed. Please try typing instead." },
+      ]);
     }
   };
 
