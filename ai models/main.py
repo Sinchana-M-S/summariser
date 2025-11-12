@@ -68,10 +68,37 @@ def set_language():
     chatbot.set_language(new_lang)
     logging.info(f"Session {session_id} language set to: {new_lang}")
     return jsonify({"message": f"Language changed to {new_lang}"}), 200
+
+@app.route('/supported-languages', methods=['GET'])
+def get_supported_languages():
+    """Returns a list of all supported languages with their configurations."""
+    languages = []
+    language_names = {
+        'en-IN': 'English (India)',
+        'hi-IN': 'Hindi',
+        'ta-IN': 'Tamil',
+        'bn-IN': 'Bengali',
+        'gu-IN': 'Gujarati',
+        'kn-IN': 'Kannada',
+        'ml-IN': 'Malayalam',
+        'mr-IN': 'Marathi',
+        'od-IN': 'Odia',
+        'pa-IN': 'Punjabi',
+        'te-IN': 'Telugu',
+    }
+    for lang_code, config in TTS_CONFIGS.items():
+        languages.append({
+            "code": lang_code,
+            "name": language_names.get(lang_code, lang_code),
+            "speaker": config.get("speaker", "default"),
+            "model": config.get("model", "bulbul:v2")
+        })
+    return jsonify({"languages": languages, "default": DEFAULT_LANG}), 200
 @app.route('/chat', methods=['POST'])
 def chat():
     """
-    Primary chat endpoint. Handles text or voice input and returns text and optional audio output.
+    Primary chat endpoint. Handles text or voice input and returns text and audio output.
+    Supports multilingual conversations with automatic TTS for all responses.
     (Used for Feature 2 Chat/Doubts, Feature 5 P2P is client-side.)
     """
     data = request.json
@@ -79,22 +106,36 @@ def chat():
     session_id = data.get("session_id", str(uuid.uuid4()))
     reset = data.get("reset", False)
     is_voice_chat = data.get("is_voice_chat", False)
+    language_code = data.get("language_code", None)  # Optional: override language for this request
+    
     chatbot = get_chatbot(session_id)
     if chatbot is None:
         return jsonify({"error": "Chatbot service is unavailable. API keys might be missing."}), 503
+    
+    # Set language if provided
+    if language_code and language_code in TTS_CONFIGS:
+        chatbot.set_language(language_code)
+        logging.info(f"Language set to {language_code} for session {session_id}")
+    
     if reset:
         chatbot.reset_session()
+    
     try:
+        # Always generate TTS audio for multilingual support
+        # Auto-detect language from input text (enabled by default)
         response_data = chatbot.generate_response(
             user_message_vernacular=user_message, 
-            is_voice_chat=is_voice_chat
+            is_voice_chat=is_voice_chat,
+            always_tts=True,  # Always generate TTS audio
+            auto_detect_language=True  # Auto-detect and switch language from input
         )
         return jsonify({
             "response": response_data['text'],
             "audio_response": response_data['audio_base64'],
             "session_id": session_id,
             "memory_turns": response_data['history_length'],
-            "language_code": chatbot.language_code
+            "language_code": response_data.get('language_code', chatbot.language_code),
+            "has_audio": response_data['audio_base64'] is not None
         })
     except Exception as e:
         logging.error(f"Unexpected error in /chat for session {session_id}: {str(e)}")
@@ -180,9 +221,29 @@ def speech_to_text():
         
         result = response.json()
         transcription_text = result.get('transcript', '')
+        detected_lang = result.get('language_code', current_lang)  # STT API may return detected language
+        
         if not transcription_text:
             return jsonify({'error': 'No clear speech detected or API failed to transcribe.'}), 500
-        return jsonify({'transcription': transcription_text, 'language_code': current_lang})
+        
+        # Auto-detect language from transcribed text if STT didn't return it
+        if detected_lang == current_lang and transcription_text:
+            # Try to detect language from the transcribed text
+            session_id = request.form.get('session_id', None)
+            if session_id:
+                chatbot = get_chatbot(session_id)
+                if chatbot:
+                    detected_lang = chatbot.detect_language(transcription_text)
+                    if detected_lang and detected_lang in TTS_CONFIGS:
+                        chatbot.set_language(detected_lang)
+                        logging.info(f"Auto-detected and switched to language: {detected_lang} from voice input")
+                        current_lang = detected_lang
+        
+        return jsonify({
+            'transcription': transcription_text, 
+            'language_code': current_lang,
+            'detected_language': detected_lang
+        })
         
     except requests.exceptions.RequestException as e:
         logging.error(f"STT API request failed: {str(e)}")
