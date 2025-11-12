@@ -8,7 +8,7 @@ from io import BytesIO
 import json
 from typing import Dict, Any, List
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-GROQ_MODEL = "llama-3.3-8b-instruct"
+GROQ_MODEL = "llama-3.1-8b-instant"
 TTS_API_URL = "https://api.sarvam.ai/text-to-speech"
 TRANSLATE_API_URL = "https://api.sarvam.ai/translate"
 
@@ -161,7 +161,7 @@ class SarvasvaChatbot:
         """
         try:
             completion = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-instruct",
+                model="llama-3.3-70b-versatile",
                 messages=[{"role": "system", "content": quiz_prompt}],
                 response_model="json" 
             )
