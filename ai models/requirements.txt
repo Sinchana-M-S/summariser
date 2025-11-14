@@ -27,3 +27,9 @@ pydub==0.25.1
 
 # --- Async / Background Tasks (if needed by video_processor) ---
 aiohttp==3.9.5
+
+# --- PDF Processing with ML/DL (for pdf_processor module) ---
+PyMuPDF>=1.23.0
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.24.0

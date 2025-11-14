@@ -811,6 +811,7 @@ def read_document():
 
     document_file = request.files['document']
     target_lang = request.form.get('language_code', DEFAULT_LANG)
+    use_pdf_processor = request.form.get('use_pdf_processor', 'true').lower() == 'true'  # Default to true for PDFs
 
     if document_file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
@@ -819,6 +820,128 @@ def read_document():
     file_bytes = document_file.read()
     
     try:
+        # For PDFs, try PDF processor first (if enabled or default)
+        if document_file.content_type == 'application/pdf' and use_pdf_processor:
+            try:
+                # Try to import PDF processor
+                try:
+                    from pdf_processor import PDFDocumentProcessor
+                except ImportError as import_err:
+                    error_details = str(import_err)
+                    logging.warning(f"PDF processor module not available: {error_details}")
+                    # Check if it's a missing dependency
+                    if 'fitz' in error_details or 'PyMuPDF' in error_details:
+                        raise Exception("PyMuPDF not installed. Install with: pip install PyMuPDF")
+                    elif 'transformers' in error_details:
+                        raise Exception("Transformers not installed. Install with: pip install transformers torch")
+                    else:
+                        raise Exception(f"PDF processor import failed: {error_details}")
+                
+                import tempfile
+                import os
+                
+                # Save to temporary file
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                    tmp_file.write(file_bytes)
+                    tmp_path = tmp_file.name
+                
+                processor = None
+                try:
+                    # Process PDF with advanced processor
+                    logging.info(f"Initializing PDF processor for file: {tmp_path}")
+                    try:
+                        processor = PDFDocumentProcessor(tmp_path)
+                    except Exception as init_err:
+                        logging.error(f"Failed to initialize PDF processor: {str(init_err)}")
+                        raise Exception(f"PDF processor initialization failed: {str(init_err)}")
+                    
+                    logging.info("Processing PDF document...")
+                    try:
+                        results = processor.process_document()
+                    except Exception as proc_doc_err:
+                        logging.error(f"Error during document processing: {str(proc_doc_err)}")
+                        import traceback
+                        logging.error(traceback.format_exc())
+                        raise Exception(f"Document processing failed: {str(proc_doc_err)}")
+                    
+                    # Get content overview
+                    try:
+                        content_overview = processor.get_content_overview()
+                        logging.info(f"PDF processed: {results.get('headings', 0)} headings found")
+                    except Exception as overview_err:
+                        logging.warning(f"Could not get content overview: {str(overview_err)}")
+                        content_overview = []
+                    
+                    # Generate overall summary from first heading if available (optional, don't fail if it errors)
+                    overall_summary = ""
+                    if content_overview and len(content_overview) > 0:
+                        try:
+                            first_heading = content_overview[0]['heading']
+                            logging.info(f"Summarizing first heading: {first_heading}")
+                            overall_summary = processor.summarize_heading(first_heading) or ""
+                        except Exception as e:
+                            logging.warning(f"Could not summarize first heading: {str(e)}")
+                            # Continue without summary
+                    
+                    # Get raw text from indexed lines before closing
+                    raw_text_sample = ""
+                    try:
+                        if hasattr(processor, 'indexed_lines') and processor.indexed_lines:
+                            raw_text_sample = "\n".join([line.get('text', '') for line in processor.indexed_lines[:100] if line.get('text', '').strip()])
+                        if not raw_text_sample:
+                            raw_text_sample = "Text extraction completed successfully."
+                    except Exception as e:
+                        logging.warning(f"Could not extract raw text sample: {str(e)}")
+                        raw_text_sample = "Text extraction completed successfully."
+                    
+                    # Prepare response before closing
+                    response_data = {
+                        "raw_text": raw_text_sample,
+                        "english_explanation": overall_summary or "PDF processed successfully. Use content_overview to explore sections.",
+                        "vernacular_explanation": overall_summary or "PDF processed successfully.",
+                        "content_overview": content_overview,
+                        "statistics": {
+                            "total_headings": results.get('headings', 0) if results else 0,
+                            "total_lines": results.get('indexed_lines', 0) if results else 0
+                        },
+                        "processed_with": "pdf_processor"
+                    }
+                    
+                    # Clean up processor
+                    try:
+                        if processor:
+                            processor.close()
+                    except Exception as close_err:
+                        logging.warning(f"Error closing processor: {str(close_err)}")
+                    processor = None
+                    
+                    return jsonify(response_data)
+                except Exception as proc_err:
+                    logging.error(f"Error in PDF processing: {str(proc_err)}")
+                    import traceback
+                    logging.error(traceback.format_exc())
+                    # Clean up processor if it exists
+                    if processor:
+                        try:
+                            processor.close()
+                        except:
+                            pass
+                    # Don't raise - fall through to OCR fallback
+                    logging.info("Falling back to OCR method due to PDF processor error")
+                finally:
+                    # Clean up temp file
+                    if os.path.exists(tmp_path):
+                        try:
+                            os.unlink(tmp_path)
+                        except:
+                            pass
+            except Exception as e:
+                error_msg = str(e)
+                logging.warning(f"PDF processor failed, falling back to OCR: {error_msg}")
+                import traceback
+                logging.error(traceback.format_exc())
+                # Always fall through to OCR method as fallback
+        
         # --- 1. Perform OCR to extract text (using Tesseract) ---
         raw_text = perform_ocr(file_bytes, document_file.content_type) 
         
@@ -879,8 +1002,641 @@ def read_document():
         })
 
     except Exception as e:
-        logging.error(f"Error in document reader: {str(e)}")
-        return jsonify({"error": f"Failed to process document: {str(e)}"}), 500
+        error_msg = str(e)
+        logging.error(f"Error in document reader: {error_msg}")
+        import traceback
+        error_trace = traceback.format_exc()
+        logging.error(f"Full traceback:\n{error_trace}")
+        
+        # Return detailed error for debugging
+        return jsonify({
+            "error": f"Failed to process document: {error_msg}",
+            "error_type": type(e).__name__,
+            "hint": "Check Flask server logs for detailed error information. Ensure all dependencies are installed (PyMuPDF, torch, transformers for PDF processor)."
+        }), 500
+
+@app.route('/api/summarize-pdf', methods=['POST'])
+def summarize_pdf():
+    """PDF processing: Extract text, summarize, and generate Q&A from PDF content"""
+    logging.info("=== PDF Summarization Request Received ===")
+    
+    # Initialize response variables
+    summary = ""
+    qa_pairs = []
+    tmp_path = None
+    processor = None
+    file_bytes = None
+    
+    try:
+        # Validate request
+        if 'document' not in request.files:
+            return jsonify({
+                'success': False,
+                'error': 'No document file uploaded',
+                'summary': 'Error: No document file uploaded. Please select a PDF file.',
+                'questions_and_answers': []
+            }), 400
+
+        document_file = request.files['document']
+        if document_file.filename == '':
+            return jsonify({
+                'success': False,
+                'error': 'No selected file',
+                'summary': 'Error: No file selected. Please select a PDF file.',
+                'questions_and_answers': []
+            }), 400
+        
+        if document_file.content_type != 'application/pdf':
+            return jsonify({
+                'success': False,
+                'error': 'Only PDF files are supported',
+                'summary': 'Error: Only PDF files are supported. Please upload a PDF file.',
+                'questions_and_answers': []
+            }), 400
+
+        file_bytes = document_file.read()
+        logging.info(f"PDF file received: {len(file_bytes)} bytes, filename: {document_file.filename}")
+        
+        # Import required modules
+        from pdf_processor import PDFDocumentProcessor
+        import tempfile
+        import os
+            
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_bytes)
+            tmp_path = tmp_file.name
+        logging.info(f"Saved PDF to temp file: {tmp_path}")
+        
+        # Process PDF
+        try:
+            logging.info("Initializing PDF processor...")
+            processor = PDFDocumentProcessor(tmp_path)
+            logging.info("Processing document...")
+            processor.process_document()
+            logging.info("Document processed successfully")
+        except Exception as proc_init_err:
+            logging.error(f"Error initializing/processing PDF: {proc_init_err}")
+            # Try direct extraction as fallback
+            try:
+                import fitz
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                text_parts = []
+                for page_num in range(min(5, len(doc))):
+                    page = doc[page_num]
+                    text = page.get_text()
+                    if text and len(text.strip()) > 20:
+                        text_parts.append(text.strip())
+                doc.close()
+                
+                if text_parts:
+                    all_text = ' '.join(text_parts)
+                    summary = all_text[:1000] + "..." if len(all_text) > 1000 else all_text
+                    return jsonify({
+                        "success": True,
+                        "summary": summary,
+                        "questions_and_answers": [],
+                        "warning": "Extracted using direct method"
+                    })
+            except Exception as fallback_err:
+                logging.error(f"Fallback extraction also failed: {fallback_err}")
+            
+            # Clean up and return error
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+            
+            return jsonify({
+                "success": False,
+                "error": f"Failed to process PDF: {str(proc_init_err)}",
+                "summary": f"Error: Could not process PDF. {str(proc_init_err)}",
+                "questions_and_answers": []
+            }), 500
+        
+        # Get all text - use multiple methods to ensure we get everything
+        all_text = ""
+        try:
+            all_text = processor.get_all_text()
+            logging.info(f"Extracted text via get_all_text: {len(all_text)} characters")
+        except Exception as text_err:
+            logging.error(f"Error in get_all_text: {text_err}")
+            all_text = ""
+        
+        # Fallback 1: Get from indexed lines (all content lines)
+        if not all_text or len(all_text.strip()) < 50:
+            logging.warning("Text too short, trying indexed lines extraction...")
+            try:
+                if hasattr(processor, 'indexed_lines') and processor.indexed_lines:
+                    # Get ALL lines, not just content classification
+                    all_lines = [line.get('text', '') for line in processor.indexed_lines if line.get('text', '').strip()]
+                    all_text = ' '.join(all_lines)
+                    logging.info(f"Fallback extraction from indexed_lines: {len(all_text)} characters")
+            except Exception as fallback_err:
+                logging.error(f"Fallback text extraction failed: {fallback_err}")
+        
+        # Fallback 2: Get from content mapper using all headings
+        if not all_text or len(all_text.strip()) < 50:
+            logging.warning("Trying content mapper extraction...")
+            try:
+                if hasattr(processor, 'content_mapper') and processor.content_mapper:
+                    content_parts = []
+                    for heading in processor.hierarchy:
+                        heading_content = processor.content_mapper.get_content_for_heading(heading)
+                        if heading_content and len(heading_content.strip()) > 20:
+                            content_parts.append(heading_content)
+                    if content_parts:
+                        all_text = ' '.join(content_parts)
+                        logging.info(f"Content mapper extraction: {len(all_text)} characters")
+            except Exception as mapper_err:
+                logging.error(f"Content mapper extraction failed: {mapper_err}")
+        
+        if not all_text or len(all_text.strip()) < 50:
+            logging.error("Insufficient text extracted from all methods")
+            if processor:
+                try:
+                    processor.close()
+                except:
+                    pass
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+            return jsonify({
+                "success": False,
+                "error": "Could not extract sufficient text from PDF",
+                "summary": "The PDF might be image-based or corrupted. Please ensure it contains readable text.",
+                "questions_and_answers": []
+            }), 400
+        
+        # Use more text for better summaries and Q&A (up to 10000 chars)
+        text_for_processing = all_text[:10000] if len(all_text) > 10000 else all_text
+        logging.info(f"Text for processing: {len(text_for_processing)} characters (from {len(all_text)} total)")
+        
+        # Generate summary using the summarizer - MUST ALWAYS RETURN A SUMMARY
+        logging.info("Generating summary using AI model...")
+        summary = None
+        
+        # Try AI summarization first
+        try:
+            if hasattr(processor, 'summarizer') and processor.summarizer:
+                try:
+                    summary = processor.summarizer.summarize(text_for_processing, max_length=400, min_length=150)
+                    if summary and len(summary.strip()) >= 20:
+                        logging.info(f"AI Summary generated: {len(summary)} characters")
+                except Exception as ai_err:
+                    logging.warning(f"AI summarization failed: {ai_err}")
+                    summary = None
+        except Exception as e:
+            logging.warning(f"Summarizer access error: {e}")
+            summary = None
+        
+        # Fallback 1: Extract key sentences (smart extraction)
+        if not summary or len(summary.strip()) < 20:
+            logging.info("Using sentence extraction fallback...")
+            try:
+                # Split into sentences
+                sentences = [s.strip() for s in text_for_processing.split('.') if len(s.strip()) > 30]
+                if sentences:
+                    # Take first 5-7 sentences for a good summary
+                    summary = '. '.join(sentences[:7]) + '.' if len(sentences) >= 7 else '. '.join(sentences) + '.'
+                    logging.info(f"Sentence extraction summary: {len(summary)} characters")
+                else:
+                    summary = None
+            except Exception as fallback_sum_err:
+                logging.error(f"Sentence extraction error: {fallback_sum_err}")
+                summary = None
+        
+        # Fallback 2: Use first 500-800 characters
+        if not summary or len(summary.strip()) < 20:
+            logging.info("Using character extraction fallback...")
+            try:
+                # Take first meaningful portion
+                summary = text_for_processing[:800].strip()
+                # Try to end at a sentence boundary
+                last_period = summary.rfind('.')
+                if last_period > 400:  # If we have a good sentence boundary
+                    summary = summary[:last_period + 1]
+                else:
+                    summary = summary[:500] + "..."
+                logging.info(f"Character extraction summary: {len(summary)} characters")
+            except Exception as char_err:
+                logging.error(f"Character extraction error: {char_err}")
+                summary = text_for_processing[:500] + "..."
+        
+        # Fallback 3: Absolute minimum - just return text
+        if not summary or len(summary.strip()) < 10:
+            summary = text_for_processing[:500] + "..." if len(text_for_processing) > 500 else text_for_processing
+            logging.warning("Using absolute minimum fallback summary")
+        
+        # Final safety check - MUST have a summary
+        summary = str(summary).strip() if summary else text_for_processing[:500] + "..."
+        if len(summary) < 20:
+            summary = text_for_processing[:500] + "..." if len(text_for_processing) > 500 else "PDF content extracted successfully."
+        
+        logging.info(f"Final summary length: {len(summary)} characters")
+        
+        # Generate Q&A from PDF content - STRICT: Only from PDF (optional, don't fail if errors)
+        qa_pairs = []
+        try:
+            chatbot = get_chatbot("pdf_summarizer")
+            if chatbot and hasattr(chatbot, 'groq_client') and chatbot.groq_client and text_for_processing:
+                logging.info("Generating questions from PDF...")
+                
+                # Generate questions
+                questions_prompt = f"""Based on this PDF content, generate exactly 5 important questions that help understand the key concepts.
+
+PDF Content:
+{text_for_processing[:5000]}
+
+Generate exactly 5 questions, one per line, numbered 1-5. Only output the questions, nothing else."""
+                
+                try:
+                    questions_completion = chatbot.groq_client.chat.completions.create(
+                        messages=[{"role": "user", "content": questions_prompt}],
+                        model=GROQ_MODEL_CHAT
+                    )
+                    questions_text = questions_completion.choices[0].message.content.strip()
+                    logging.info(f"Questions generated: {len(questions_text)} characters")
+                except Exception as q_err:
+                    logging.error(f"Error generating questions: {q_err}")
+                    import traceback
+                    logging.error(traceback.format_exc())
+                    questions_text = ""
+                
+                # Parse questions
+                questions = []
+                if questions_text:
+                    for line in questions_text.split('\n'):
+                        line = line.strip()
+                        if line and len(line) > 5:
+                            # Remove numbering
+                            if line[0].isdigit():
+                                question = re.sub(r'^\d+[\.\)]\s*', '', line).strip()
+                            elif line.startswith('-') or line.startswith('*'):
+                                question = re.sub(r'^[-*]\s*', '', line).strip()
+                            else:
+                                question = line
+                            
+                            if question and len(question) > 10:
+                                if not question.endswith('?'):
+                                    question += '?'
+                                questions.append(question)
+                
+                # Limit to 5 questions
+                questions = questions[:5]
+                logging.info(f"Parsed {len(questions)} questions")
+                
+                # Generate answers STRICTLY from PDF content - use more context
+                logging.info("Generating answers from PDF content...")
+                for idx, question in enumerate(questions, 1):
+                    try:
+                        logging.info(f"Generating answer {idx}/{len(questions)} for: {question[:50]}...")
+                        
+                        # Find relevant context for the question (search for keywords in PDF)
+                        question_keywords = [w.lower() for w in question.split() if len(w) > 3 and w.lower() not in ['what', 'when', 'where', 'which', 'whose', 'about', 'from', 'this', 'that', 'these', 'those']]
+                        
+                        # Use full text for better context (up to 8000 chars)
+                        context_text = text_for_processing[:8000] if len(text_for_processing) > 8000 else text_for_processing
+                        
+                        # STRICT prompt - answer ONLY from PDF with emphasis on accuracy
+                        answer_prompt = f"""You are a PDF content analyzer. Your task is to answer the question using ONLY the information provided in the PDF content below.
+
+CRITICAL RULES - FOLLOW STRICTLY:
+1. Answer ONLY using information from the PDF content provided below
+2. Do NOT use any external knowledge, general knowledge, or information not in the PDF
+3. If the answer is not in the PDF content, you MUST respond with: "This information is not available in the PDF."
+4. Quote directly from the PDF when possible - use exact phrases from the PDF
+5. Be precise and accurate - only state facts that appear in the PDF
+6. If you're unsure, say "This information is not available in the PDF."
+7. Do not make assumptions or inferences beyond what is explicitly stated
+
+PDF Content:
+{context_text}
+
+Question: {question}
+
+IMPORTANT: Answer using ONLY the PDF content above. If the answer is not in the PDF, say "This information is not available in the PDF."
+
+Answer:"""
+                        
+                        answer_completion = chatbot.groq_client.chat.completions.create(
+                            messages=[{"role": "user", "content": answer_prompt}],
+                            model=GROQ_MODEL_CHAT,
+                            temperature=0.1  # Lower temperature for more accurate, factual answers
+                        )
+                        
+                        answer = answer_completion.choices[0].message.content.strip()
+                        
+                        # Verify answer contains information (not just "not available")
+                        if answer and len(answer) > 10:
+                            # Check if answer seems to be from PDF (contains some keywords from question or PDF)
+                            answer_lower = answer.lower()
+                            has_relevant_content = any(
+                                keyword in answer_lower or 
+                                answer_lower not in ['this information is not available in the pdf.', 'this information is not available in the pdf']
+                                for keyword in question_keywords[:3]  # Check first 3 keywords
+                            ) if question_keywords else True
+                            
+                            if has_relevant_content or 'not available' in answer_lower:
+                                qa_pairs.append({
+                                    "question": question,
+                                    "answer": answer
+                                })
+                                logging.info(f"Answer {idx} generated successfully ({len(answer)} chars)")
+                            else:
+                                logging.warning(f"Answer {idx} seems irrelevant, skipping")
+                    except Exception as e:
+                        logging.warning(f"Error generating answer for '{question}': {e}")
+                        import traceback
+                        logging.warning(traceback.format_exc())
+                        continue
+                
+                logging.info(f"Generated {len(qa_pairs)} Q&A pairs")
+            else:
+                logging.warning("Chatbot not available for Q&A generation")
+        except Exception as qa_err:
+            logging.warning(f"Q&A generation failed: {qa_err}")
+            import traceback
+            logging.warning(traceback.format_exc())
+            # Continue without Q&A - summary is more important
+        
+        # Clean up processor
+        if processor:
+            try:
+                processor.close()
+            except:
+                pass
+        
+        # Clean up temp file
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+        
+        # ALWAYS return summary - even if Q&A failed
+        if not summary or len(summary.strip()) < 10:
+            summary = "PDF processed successfully. Content extracted from the document."
+        
+        response = {
+            "success": True,
+            "summary": str(summary),
+            "questions_and_answers": qa_pairs if qa_pairs else []
+        }
+        logging.info(f"=== SUCCESS: Returning response with summary ({len(summary)} chars) and {len(qa_pairs)} Q&A pairs ===")
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        logging.error(f"PDF processing error: {str(e)}")
+        import traceback
+        error_trace = traceback.format_exc()
+        logging.error(f"Full traceback:\n{error_trace}")
+        
+        # Last resort: Try to extract text directly from PDF bytes
+        fallback_summary = None
+        try:
+            import fitz  # PyMuPDF
+            if file_bytes:
+                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                text_parts = []
+                for page_num in range(min(5, len(doc))):
+                    page = doc[page_num]
+                    text = page.get_text()
+                    if text and len(text.strip()) > 20:
+                        text_parts.append(text.strip())
+                doc.close()
+                
+                if text_parts:
+                    combined_text = ' '.join(text_parts)
+                    sentences = [s.strip() for s in combined_text.split('.') if len(s.strip()) > 30]
+                    if sentences:
+                        fallback_summary = '. '.join(sentences[:5]) + '.'
+                    else:
+                        fallback_summary = combined_text[:500] + "..."
+                    logging.info(f"Extracted fallback summary via PyMuPDF: {len(fallback_summary)} chars")
+        except Exception as pdf_err:
+            logging.warning(f"PyMuPDF fallback also failed: {pdf_err}")
+        
+        # Clean up
+        if processor:
+            try:
+                processor.close()
+            except:
+                pass
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
+        
+        # ALWAYS return something
+        if fallback_summary:
+            return jsonify({
+                "success": True,
+                "summary": fallback_summary,
+                "questions_and_answers": [],
+                "warning": "Extracted using fallback method"
+            })
+        
+        return jsonify({
+            "success": False,
+            "error": f"Failed to process PDF: {str(e)}",
+            "summary": f"Error: Could not process PDF. {str(e)}. Please ensure the PDF contains readable text and try again.",
+            "questions_and_answers": []
+        }), 500
+
+@app.route('/api/summarize-section', methods=['POST'])
+def summarize_section():
+    """Summarize a specific section (heading or subheading) from a processed PDF"""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({'error': 'No JSON data provided'}), 400
+    
+    pdf_path = data.get('pdf_path')
+    section_text = data.get('section_text')
+    section_type = data.get('section_type', 'subheading')  # 'heading' or 'subheading'
+    
+    if not pdf_path or not section_text:
+        return jsonify({'error': 'pdf_path and section_text are required'}), 400
+    
+    try:
+        from pdf_processor import PDFDocumentProcessor
+        import os
+        
+        if not os.path.exists(pdf_path):
+            return jsonify({'error': 'PDF file not found'}), 404
+        
+        processor = PDFDocumentProcessor(pdf_path)
+        processor.process_document()
+        
+        # Summarize based on type
+        if section_type == 'heading':
+            summary = processor.summarize_heading(section_text)
+        else:
+            summary = processor.summarize_subheading(section_text)
+        
+        processor.close()
+        
+        if summary:
+            return jsonify({
+                "success": True,
+                "section_text": section_text,
+                "section_type": section_type,
+                "summary": summary
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "error": f"Section '{section_text}' not found"
+            }), 404
+
+    except Exception as e:
+        logging.error(f"Error summarizing section: {str(e)}")
+        return jsonify({"error": f"Failed to summarize section: {str(e)}"}), 500
+
+@app.route('/api/pdf-qa', methods=['POST'])
+def pdf_qa():
+    """Answer questions about a PDF using exact content from the document"""
+    if 'document' not in request.files:
+        return jsonify({'error': 'No document file uploaded'}), 400
+    
+    question = request.form.get('question', '').strip()
+    if not question:
+        return jsonify({'error': 'No question provided'}), 400
+    
+    document_file = request.files['document']
+    if document_file.filename == '' or document_file.content_type != 'application/pdf':
+        return jsonify({'error': 'Invalid PDF file'}), 400
+    
+    file_bytes = document_file.read()
+    
+    try:
+        from pdf_processor import PDFDocumentProcessor
+        import tempfile
+        import os
+        import re
+        
+        # Save to temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+            tmp_file.write(file_bytes)
+            tmp_path = tmp_file.name
+        
+        processor = None
+        try:
+            # Process PDF
+            processor = PDFDocumentProcessor(tmp_path)
+            processor.process_document()
+            
+            # Search through indexed lines for relevant content
+            question_lower = question.lower()
+            question_words = set(re.findall(r'\b\w+\b', question_lower))
+            
+            # Find relevant lines by keyword matching
+            relevant_lines = []
+            for line in processor.indexed_lines:
+                line_text = line.get('text', '').lower()
+                line_words = set(re.findall(r'\b\w+\b', line_text))
+                
+                # Calculate relevance score (word overlap)
+                overlap = len(question_words.intersection(line_words))
+                if overlap > 0:
+                    relevant_lines.append({
+                        'text': line.get('text', ''),
+                        'page': line.get('page', 0),
+                        'line_number': line.get('line_number', 0),
+                        'relevance': overlap
+                    })
+            
+            # Sort by relevance and get top matches
+            relevant_lines.sort(key=lambda x: x['relevance'], reverse=True)
+            top_lines = relevant_lines[:20]  # Get top 20 most relevant lines
+            
+            # Combine relevant content
+            context_text = "\n".join([
+                f"[Page {line['page']}, Line {line['line_number']}]: {line['text']}"
+                for line in top_lines
+            ])
+            
+            if not context_text.strip():
+                # Fallback: use all content lines
+                context_text = "\n".join([
+                    f"[Page {line.get('page', 0)}, Line {line.get('line_number', 0)}]: {line.get('text', '')}"
+                    for line in processor.indexed_lines[:100]
+                ])
+            
+            # Use chatbot to answer based on the extracted context
+            chatbot = get_chatbot("pdf_qa")
+            if chatbot is None:
+                return jsonify({"error": "Chatbot service is unavailable. API keys might be missing."}), 503
+            
+            # Create prompt that emphasizes using only the provided context
+            system_prompt = f"""You are a helpful assistant that answers questions based EXACTLY on the provided PDF content. 
+            
+IMPORTANT RULES:
+1. Answer ONLY using information from the provided PDF content below
+2. If the answer is not in the provided content, say "I cannot find this information in the PDF"
+3. Quote specific page and line numbers when referencing content
+4. Be precise and cite your sources from the PDF
+
+PDF Content:
+{context_text[:4000]}
+
+Question: {question}
+
+Answer based ONLY on the PDF content above:"""
+            
+            chat_completion = chatbot.groq_client.chat.completions.create(
+                messages=[{"role": "system", "content": system_prompt}],
+                model=GROQ_MODEL_CHAT
+            )
+            
+            answer = chat_completion.choices[0].message.content
+            
+            # Include source references
+            source_references = []
+            if top_lines:
+                pages_mentioned = sorted(set(line['page'] for line in top_lines[:5]))
+                source_references = [f"Page {p}" for p in pages_mentioned]
+            
+            processor.close()
+            processor = None
+            
+            return jsonify({
+                "success": True,
+                "question": question,
+                "answer": answer,
+                "sources": source_references,
+                "relevant_lines_found": len(relevant_lines)
+            })
+            
+        except Exception as proc_err:
+            logging.error(f"Error in PDF Q&A: {str(proc_err)}")
+            import traceback
+            logging.error(traceback.format_exc())
+            if processor:
+                try:
+                    processor.close()
+                except:
+                    pass
+            raise proc_err
+        finally:
+            # Clean up temp file
+            if os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except:
+                    pass
+    
+    except Exception as e:
+        logging.error(f"Error in PDF Q&A: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Failed to answer question: {str(e)}"}), 500
 if __name__ == '__main__':
     logging.info("Starting SARVASVA AI Service...")
     AI_PORT = int(os.getenv('AI_PORT', 5001))

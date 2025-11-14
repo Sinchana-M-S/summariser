@@ -157,8 +157,82 @@ router.post("/summarize", async (req, res) => {
     res.json(response.data);
   } catch (error) {
     console.error("Summarization Error:", error.response?.data || error.message);
+    if (error.code === 'ECONNREFUSED') {
+      return res.status(503).json({
+        error: "AI service is not running. Please start the Flask AI service on port 5001.",
+        hint: "Run: cd 'ai models' && python main.py"
+      });
+    }
     res.status(error.response?.status || 500).json({
       error: error.response?.data?.error || "Summarization failed",
+      details: error.message
+    });
+  }
+});
+
+// ✅ Summarize PDF - Advanced PDF processing with ML/DL (like sum folder)
+router.post("/summarize-pdf", upload.single("document"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No PDF file uploaded" });
+    }
+
+    const FormData = require("form-data");
+    const formData = new FormData();
+    formData.append("document", req.file.buffer, {
+      filename: req.file.originalname,
+      contentType: req.file.mimetype,
+    });
+
+    const response = await axios.post(`${AI_SERVICE_URL}/api/summarize-pdf`, formData, {
+      headers: {
+        ...formData.getHeaders(),
+      },
+      timeout: 300000, // 5 minutes timeout for PDF processing
+    });
+
+    res.json(response.data);
+  } catch (error) {
+    console.error("PDF Summarization Error:", error.response?.data || error.message);
+    if (error.code === 'ECONNREFUSED') {
+      return res.status(503).json({
+        error: "AI service is not running. Please start the Flask AI service on port 5001.",
+        hint: "Run: cd 'ai models' && python main.py"
+      });
+    }
+    if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+      return res.status(504).json({
+        error: "PDF processing timed out. The PDF might be too large or complex.",
+        hint: "Try with a smaller PDF or check Flask server logs"
+      });
+    }
+    res.status(error.response?.status || 500).json({
+      success: false,
+      error: error.response?.data?.error || error.response?.data?.message || "PDF processing failed",
+      details: error.response?.data?.details || error.message,
+      error_type: error.response?.data?.error_type
+    });
+  }
+});
+
+// ✅ Summarize Section - Summarize a specific heading/subheading
+router.post("/summarize-section", async (req, res) => {
+  try {
+    const response = await axios.post(`${AI_SERVICE_URL}/api/summarize-section`, req.body, {
+      headers: { "Content-Type": "application/json" },
+    });
+    res.json(response.data);
+  } catch (error) {
+    console.error("Section Summarization Error:", error.response?.data || error.message);
+    if (error.code === 'ECONNREFUSED') {
+      return res.status(503).json({
+        error: "AI service is not running. Please start the Flask AI service on port 5001.",
+        hint: "Run: cd 'ai models' && python main.py"
+      });
+    }
+    res.status(error.response?.status || 500).json({
+      error: error.response?.data?.error || "Section summarization failed",
+      details: error.message
     });
   }
 });
@@ -212,6 +286,55 @@ router.post("/peer-chat", async (req, res) => {
   }
 });
 
+// ✅ PDF Q&A - Answer questions about PDF using exact content
+router.post("/pdf-qa", upload.single("document"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No PDF file uploaded" });
+    }
+
+    const question = req.body.question;
+    if (!question || !question.trim()) {
+      return res.status(400).json({ error: "No question provided" });
+    }
+
+    const FormData = require("form-data");
+    const formData = new FormData();
+    formData.append("document", req.file.buffer, {
+      filename: req.file.originalname,
+      contentType: req.file.mimetype,
+    });
+    formData.append("question", question);
+
+    const response = await axios.post(`${AI_SERVICE_URL}/api/pdf-qa`, formData, {
+      headers: {
+        ...formData.getHeaders(),
+      },
+      timeout: 300000, // 5 minutes timeout
+    });
+
+    res.json(response.data);
+  } catch (error) {
+    console.error("PDF Q&A Error:", error.response?.data || error.message);
+    if (error.code === 'ECONNREFUSED') {
+      return res.status(503).json({
+        error: "AI service is not running. Please start the Flask AI service on port 5001.",
+        hint: "Run: cd 'ai models' && python main.py"
+      });
+    }
+    if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+      return res.status(504).json({
+        error: "Question answering timed out. The PDF might be too large.",
+        hint: "Try with a smaller PDF or check Flask server logs"
+      });
+    }
+    res.status(error.response?.status || 500).json({
+      error: error.response?.data?.error || "Failed to answer question",
+      details: error.response?.data?.details || error.message
+    });
+  }
+});
+
 // ✅ Read Document - proxy to Flask /read-document
 router.post("/read-document", upload.single("document"), async (req, res) => {
   try {
@@ -235,15 +358,28 @@ router.post("/read-document", upload.single("document"), async (req, res) => {
       headers: {
         ...formData.getHeaders(),
       },
-      timeout: 120000, // 2 minutes timeout for document processing
+      timeout: 300000, // 5 minutes timeout for document processing (PDF processing can be slow)
     });
 
     res.json(response.data);
   } catch (error) {
     console.error("Document Read Error:", error.response?.data || error.message);
+    if (error.code === 'ECONNREFUSED') {
+      return res.status(503).json({
+        error: "AI service is not running. Please start the Flask AI service on port 5001.",
+        hint: "Run: cd 'ai models' && python main.py"
+      });
+    }
+    if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+      return res.status(504).json({
+        error: "Document processing timed out. The PDF might be too large or complex.",
+        hint: "Try with a smaller PDF or check Flask server logs"
+      });
+    }
     res.status(error.response?.status || 500).json({
-      error: error.response?.data?.error || "Document processing failed",
-      details: error.message
+      error: error.response?.data?.error || error.response?.data?.message || "Document processing failed",
+      details: error.response?.data?.hint || error.message,
+      error_type: error.response?.data?.error_type
     });
   }
 });
